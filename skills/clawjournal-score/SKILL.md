@@ -20,6 +20,8 @@ clawjournal score --batch --source failure-v1 --limit 20
 ```
 
 For hands-on scoring of a specific session, continue below.
+With `--auto-triage`, only productivity-1 sessions with failure value 1-2 are
+auto-blocked; failure value 3+ stays reviewable.
 
 ## Session Data
 
@@ -40,11 +42,13 @@ clawjournal score --batch --limit 10
 ClawJournal now records two scores in one pass:
 
 - `ai_quality_score`: legacy productivity/substance score.
-- `ai_failure_value_score`: primary capture score for SOTA-agent failure behavior.
+- `ai_failure_value_score`: primary capture score for understanding
+  frontier-agent failure and recovery behavior.
 
 Failure value:
 
-**5 = Clear consequential failure** — Real expert work, strong evidence, useful lesson.
+**5 = Canonical high-value trace** — Consequential failure or recovery pattern
+on real expert work, where the agent behavior is the lesson.
 
 **4 = Meaningful failure/recovery** — Worth reviewing or turning into eval/training data.
 
@@ -64,6 +68,11 @@ Failure modes (`ai_failure_modes`): `task_framing`, `method_selection`, `context
 
 Meta labels (`ai_meta_labels`): `evaluation_measurement` only — emit when the evaluation/measurement setup itself misjudges the agent, not when the agent failed.
 
+Scores of 4 or 5 require at least one `ai_failure_evidence` snippet. A 5/5
+does not require `agent_caused`; non-agent-caused traces can be high value when
+the agent's recovery, uncertainty handling, escalation, or collaboration is the
+lesson.
+
 ### Detailed rubric
 
 See `RUBRIC.md` in this directory for the full scoring rubric with examples. In the repo, this file is generated from `clawjournal/prompts/agents/scoring/rubric.md`; edit the canonical prompt copy first, then run `python -m clawjournal.prompt_sync`.
@@ -75,9 +84,11 @@ See `RUBRIC.md` in this directory for the full scoring rubric with examples. In 
 
 ## Store the Score
 
-Manual score setting only updates the legacy productivity score. Prefer
-`clawjournal score` for failure-value annotations.
+Manual score setting can override failure value directly. Keep `--quality` for
+legacy productivity compatibility only. Failure-value overrides to 4-5 require
+trace-backed evidence.
 
 ```bash
-clawjournal set-score <session-id> --quality <score> --reason "<1-2 sentence explanation>"
+clawjournal set-score <session-id> --failure-value <score> --failure-evidence "<trace-backed snippet>" --reason "<1-2 sentence explanation>"
+clawjournal set-score <session-id> --quality <score> --reason "<legacy productivity note>"
 ```
