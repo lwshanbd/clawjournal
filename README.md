@@ -366,9 +366,13 @@ cd ~/clawjournal
 
 #### If the Share queue is empty (after refreshing)
 
-The queue only lists sessions that are cleared to leave your machine. If it's still empty:
+The queue only lists sessions that are cleared by the local hold-state gate. An empty queue does not necessarily mean there is nothing to share — it can simply mean ClawJournal did not find a recommended default set.
 
-- **Approve some sessions** — only *approved* sessions are eligible. Triage them in the **Sessions** tab ([Stage 4](#4-triage)).
+When shareable sessions exist, the Queue step opens a picker directly. Use the search, source, project, date, and failure-value filters to add the sessions you want, then continue to **Redact** and **Review**. The picker may include sessions that have not been approved in **Sessions** yet; they still must pass hold-state gates, and you still approve the redacted version before packaging.
+
+If the picker is empty or you see **No traces ready to share**:
+
+- **Refresh or scan again** — the workbench may still be indexing.
 - **Release any holds** — sessions on hold (`pending_review`) or under an active embargo are excluded until you release them.
 - **Check your exclusions** — a project you excluded with `clawjournal config --exclude` won't show up.
 
@@ -387,7 +391,7 @@ Upload the printed `zip_path` at **[data.rayward.ai/share](https://data.rayward.
 
 > ⚠️ **`clawjournal bundle-share` is NOT the Rayward path.** There is no Rayward hosted CLI upload in this local-first build — that's why `bundle-share` reports *"Hosted sharing is not configured."* It only uploads to a **self-hosted** ingest server you set up yourself via `CLAWJOURNAL_INGEST_URL`. STEM Data Program participants should ignore it.
 
-**What leaves your machine — and what's redacted.** Only sessions you approved and confirmed for sharing are ever uploaded; `pending_review` and active `embargoed` sessions are blocked. Redaction (your configured strings, file paths, usernames, secrets) is applied to **everything in the bundle** — the session traces *and* the `manifest.json` metadata (project, source, model, and IDs). If you saw a configured term in `manifest.json` before, refresh and re-export: that's fixed.
+**What leaves your machine — and what's redacted.** Only sessions you explicitly add to a bundle and confirm for sharing are ever uploaded; `pending_review` and active `embargoed` sessions are blocked. Redaction (your configured strings, file paths, usernames, secrets) is applied to **everything in the bundle** — the session traces *and* the `manifest.json` metadata (project, source, model, and IDs). If you saw a configured term in `manifest.json` before, refresh and re-export: that's fixed.
 
 <details>
 <summary><b>Show shell commands</b></summary>
@@ -671,7 +675,7 @@ Each line in the exported JSONL is one session:
 - **`scan` already redacts.** Secrets and PII findings are computed and stored as hashed references at scan time. For additional LLM-PII review, opt in on the workbench Share page. The legacy `--pii-review` / `--pii-apply` CLI path still works for sanitizing already-exported files.
 - **Hold-state gates uploads.** Sessions in `pending_review` or active `embargoed` cannot be shared; `auto_redacted` (default) and `released` can.
 - **If `bundle-export --zip` is not recognized, your shell is running an older ClawJournal.** Re-run the GitHub installer, then use `~/.clawjournal-venv/bin/clawjournal bundle-export <bundle_id> --zip` or put `~/.clawjournal-venv/bin` first on `PATH`. The PyPI fallback can lag behind the README.
-- **"Your queue is empty" in the Share tab?** Refresh first (`./scripts/install.sh --with-frontend` rebuilds the workbench). If it persists, the queue only lists *approved*, non-held, non-excluded sessions — approve some in the Sessions tab, release any holds/embargoes, and check `clawjournal config --exclude`.
+- **"Your queue is empty" in the Share tab?** Refresh first (`./scripts/install.sh --with-frontend` rebuilds the workbench). If shareable sessions exist, Share opens a picker instead of a dead end. If the picker is empty, release any holds/embargoes, check `clawjournal config --exclude`, and scan again so the workbench can find shareable sessions.
 - **Large exports take time** — 500+ sessions may take 1–3 minutes.
 - **Virtual environment recommended** — modern Linux (and some macOS setups) block system-wide pip installs. Use a venv to avoid issues.
 

@@ -77,6 +77,15 @@ export function Share() {
   const [scoreFilter, setScoreFilter] = useState(0);
   const [dateFilter, setDateFilter] = useState('');
 
+  const resetAddTracesPicker = useCallback(() => {
+    setShowAddTraces(false);
+    setSearchQuery('');
+    setSourceFilter('');
+    setProjectFilter('');
+    setScoreFilter(0);
+    setDateFilter('');
+  }, []);
+
   // Redaction state
   const [redactedSessions, setRedactedSessions] = useState<Record<string, RedactedSessionData>>({});
 
@@ -285,7 +294,9 @@ export function Share() {
   // =================================================
 
   const removeFromQueue = (id: string) => {
-    setQueueOrder((prev) => prev.filter((x) => x !== id));
+    const next = queueOrder.filter((x) => x !== id);
+    setQueueOrder(next);
+    if (next.length === 0) resetAddTracesPicker();
   };
 
   const addToQueue = (id: string) => {
@@ -343,8 +354,9 @@ export function Share() {
     setPackageLog('');
     setPackagingFailed(null);
     setBlockedPackageSessions([]);
+    resetAddTracesPicker();
     setActiveStep('queue');
-  }, []);
+  }, [resetAddTracesPicker]);
 
   const onStepClick = (key: string) => {
     const k = key as StepKey;
