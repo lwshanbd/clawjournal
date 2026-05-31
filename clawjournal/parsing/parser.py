@@ -334,6 +334,36 @@ def _build_cowork_project_name(workspace_key: str, la_sessions: list[dict]) -> s
     return f"claude:cowork/{outer_id[:12]}"
 
 
+def _claude_cwd_dirs(
+    native_dir: Path | None = None,
+    local_agent_sessions: list[dict] | None = None,
+) -> list[Path]:
+    """Return Claude transcript dirs that may contain a recorded cwd."""
+    dirs: list[Path] = []
+    if native_dir:
+        dirs.append(native_dir)
+    for la_session in local_agent_sessions or []:
+        nested = la_session.get("nested_project_dir")
+        if nested:
+            dirs.append(nested)
+    return dirs
+
+
+def _build_claude_project_name(
+    project_dir_name: str,
+    *,
+    native_dir: Path | None = None,
+    local_agent_sessions: list[dict] | None = None,
+) -> str:
+    if project_dir_name.startswith("_cowork_"):
+        return _build_cowork_project_name(project_dir_name, local_agent_sessions or [])
+
+    cwd = _read_project_cwd(*_claude_cwd_dirs(native_dir, local_agent_sessions))
+    if cwd:
+        return f"claude:{Path(cwd).name or cwd}"
+    return _build_project_name(project_dir_name)
+
+
 def discover_projects(source_filter: str | None = None) -> list[dict]:
     """Discover supported source projects with optional source filtering."""
     discovery_by_source = {
@@ -385,7 +415,10 @@ def _discover_claude_projects() -> list[dict]:
                     total_size += sa_file.stat().st_size
             canonical[project_dir.name] = {
                 "dir_name": project_dir.name,
-                "display_name": _build_project_name(project_dir.name),
+                "display_name": _build_claude_project_name(
+                    project_dir.name,
+                    native_dir=project_dir,
+                ),
                 "session_count": total_count,
                 "total_size_bytes": total_size,
                 "source": CLAUDE_SOURCE,
@@ -402,6 +435,11 @@ def _discover_claude_projects() -> list[dict]:
         if workspace_key in canonical:
             # Merge into existing native project
             canonical[workspace_key]["locator"]["local_agent_sessions"].extend(la_sessions)
+            canonical[workspace_key]["display_name"] = _build_claude_project_name(
+                workspace_key,
+                native_dir=canonical[workspace_key]["locator"]["native_project_dir"],
+                local_agent_sessions=canonical[workspace_key]["locator"]["local_agent_sessions"],
+            )
             native_ids = _get_native_session_ids(canonical[workspace_key]["locator"]["native_project_dir"])
             new_la = [s for s in la_sessions if s["cli_session_id"] not in native_ids and s.get("nested_project_dir")]
             canonical[workspace_key]["session_count"] += len(new_la)
@@ -410,10 +448,10 @@ def _discover_claude_projects() -> list[dict]:
             )
         else:
             # New project from local-agent only
-            if workspace_key.startswith("_cowork_"):
-                display_name = _build_cowork_project_name(workspace_key, la_sessions)
-            else:
-                display_name = _build_project_name(workspace_key)
+            display_name = _build_claude_project_name(
+                workspace_key,
+                local_agent_sessions=la_sessions,
+            )
             parseable = [s for s in la_sessions if s.get("nested_project_dir")]
             canonical[workspace_key] = {
                 "dir_name": workspace_key,
@@ -815,21 +853,18 @@ def parse_project_sessions(
     sessions = []
     seen_session_ids: set[str] = set()
 
-    # Determine project display name
-    if project_dir_name.startswith("_cowork_"):
-        project_name = _build_cowork_project_name(
-            project_dir_name,
-            locator.get("local_agent_sessions", []) if locator else [],
-        )
-    else:
-        project_name = _build_project_name(project_dir_name)
-
     # Priority 1: Native ~/.claude/projects
     native_dir = None
     if locator and locator.get("native_project_dir"):
         native_dir = locator["native_project_dir"]
     elif not locator:
         native_dir = PROJECTS_DIR / project_dir_name
+
+    project_name = _build_claude_project_name(
+        project_dir_name,
+        native_dir=native_dir,
+        local_agent_sessions=locator.get("local_agent_sessions", []) if locator else [],
+    )
 
     if native_dir and native_dir.exists():
         for session_file in sorted(native_dir.glob("*.jsonl")):
@@ -2097,6 +2132,62 @@ def _extract_codex_cwd(session_file: Path) -> str | None:
                     return cwd
     except OSError:
         return None
+    return None
+
+
+def _first_cwd_in_session_file(session_file: Path) -> str | None:
+    """Return the first absolute ``cwd`` recorded in a session JSONL, or None."""
+    try:
+        with open(session_file, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                cwd = obj.get("cwd") if isinstance(obj, dict) else None
+                if isinstance(cwd, str) and cwd:
+                    return cwd
+    except OSError:
+        return None
+    return None
+
+
+def _read_project_cwd(*project_dirs: Path) -> str | None:
+    """Recover the project's real working directory from session content.
+
+    Claude encodes the project dir name as the cwd with ``/`` replaced by
+    ``-``, which is lossy when a folder name itself contains ``-`` (e.g.
+    ``llm-gateway-infra`` is indistinguishable from ``llm/gateway/infra``).
+    Each Claude session JSONL records the absolute ``cwd``, so reading it
+    recovers the true basename. Searches the given directories — root sessions
+    first, then nested subagent / local-agent transcripts — and returns the
+    first ``cwd`` found, or None."""
+    for project_dir in project_dirs:
+        if not project_dir:
+            continue
+        try:
+            roots = sorted(project_dir.glob("*.jsonl"))
+        except OSError:
+            roots = []
+        for session_file in roots:
+            cwd = _first_cwd_in_session_file(session_file)
+            if cwd:
+                return cwd
+        # Nested fallback: subagent-only projects have no root *.jsonl; subagent
+        # and local-agent transcripts live in subdirectories. Materialize inside
+        # the try — rglob is lazy and raises OSError during iteration (e.g. an
+        # unreadable subdir), not at creation — and sort for deterministic order.
+        try:
+            nested = sorted(project_dir.rglob("*.jsonl"))
+        except OSError:
+            nested = []
+        for session_file in nested:
+            cwd = _first_cwd_in_session_file(session_file)
+            if cwd:
+                return cwd
     return None
 
 
