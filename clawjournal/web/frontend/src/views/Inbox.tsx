@@ -6,9 +6,12 @@ import { useToast } from '../components/Toast.tsx';
 import { ConfirmDialog } from '../components/ConfirmDialog.tsx';
 import { Spinner } from '../components/Spinner.tsx';
 import { LABELS } from '../components/BadgeChip.tsx';
+import { GettingStartedGuide } from '../components/GettingStartedGuide.tsx';
 import { colors, selectStyle } from '../theme.ts';
 
 const PAGE_SIZE = 10;
+const TYPE_CHIP_PREVIEW_LIMIT = 16;
+const GETTING_STARTED_DISMISSED_KEY = 'cj.gettingStartedGuideV2Dismissed';
 
 function failureBadge(score: number | null): string {
   if (score == null) return '\u2014';
@@ -105,6 +108,13 @@ export function Inbox() {
   const { toast } = useToast();
   const [sessions, setSessions] = useState<Session[]>([]);
   const [stats, setStats] = useState<Stats>({ total: 0, by_status: {}, by_source: {}, by_project: {}, by_task_type: {} });
+  const [showGettingStartedGuide, setShowGettingStartedGuide] = useState(() => {
+    try {
+      return localStorage.getItem(GETTING_STARTED_DISMISSED_KEY) !== '1';
+    } catch {
+      return true;
+    }
+  });
   const [loading, setLoading] = useState(false);
   const [offset, setOffset] = useState(0);
   const [expandedId, setExpandedId] = useState<string | null>(null);
@@ -116,6 +126,7 @@ export function Inbox() {
   const [recoveryFilter, setRecoveryFilter] = useState<string | null>(null);
   const [attributionFilter, setAttributionFilter] = useState<string | null>(null);
   const [modeFilter, setModeFilter] = useState<string | null>(null);
+  const [showAllTaskTypes, setShowAllTaskTypes] = useState(false);
 
   // Agent-classified type filter (dynamic, not hardcoded)
   const [typeFilter, setTypeFilter] = useState<string | null>(null);
@@ -279,6 +290,22 @@ export function Inbox() {
   // Derive agent-classified types from stats (dynamic, not hardcoded)
   const taskTypes = Object.entries(stats.by_task_type ?? {})
     .sort(([, a], [, b]) => b - a);
+  const visibleTaskTypes = showAllTaskTypes ? taskTypes : (() => {
+    const top = taskTypes.slice(0, TYPE_CHIP_PREVIEW_LIMIT);
+    if (typeFilter && !top.some(([type]) => type === typeFilter)) {
+      const active = taskTypes.find(([type]) => type === typeFilter);
+      return active ? [...top, active] : top;
+    }
+    return top;
+  })();
+  const hiddenTaskTypeCount = Math.max(0, taskTypes.length - TYPE_CHIP_PREVIEW_LIMIT);
+
+  const dismissGettingStartedGuide = () => {
+    setShowGettingStartedGuide(false);
+    try {
+      localStorage.setItem(GETTING_STARTED_DISMISSED_KEY, '1');
+    } catch { /* ignore */ }
+  };
 
   return (
     <div style={{ padding: '14px 20px' }}>
@@ -303,6 +330,10 @@ export function Inbox() {
           </button>
         </div>
       </div>
+
+      {showGettingStartedGuide && stats.total > 0 && sessions.length > 0 && !typeFilter && (
+        <GettingStartedGuide stats={stats} onDismiss={dismissGettingStartedGuide} />
+      )}
 
       {showFilters && (
         <div style={{ display: 'flex', gap: '6px', marginBottom: '8px' }}>
@@ -389,7 +420,7 @@ export function Inbox() {
           >
             All ({stats.total})
           </button>
-          {taskTypes.map(([type, count]) => {
+          {visibleTaskTypes.map(([type, count]) => {
             const active = typeFilter === type;
             const c = typeColor(type);
             return (
@@ -421,6 +452,23 @@ export function Inbox() {
               </button>
             );
           })}
+          {hiddenTaskTypeCount > 0 && (
+            <button
+              onClick={() => setShowAllTaskTypes(prev => !prev)}
+              style={{
+                padding: '4px 12px',
+                borderRadius: 9999,
+                fontSize: 13,
+                fontWeight: 600,
+                cursor: 'pointer',
+                border: `1px solid ${colors.gray300}`,
+                background: colors.gray50,
+                color: colors.gray600,
+              }}
+            >
+              {showAllTaskTypes ? 'Show fewer' : `More (${hiddenTaskTypeCount})`}
+            </button>
+          )}
         </div>
       )}
 
