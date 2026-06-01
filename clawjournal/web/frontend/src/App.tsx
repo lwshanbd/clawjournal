@@ -7,6 +7,7 @@ import { Share } from './views/Share/index.tsx';
 import { Policies } from './views/Policies.tsx';
 import { Dashboard } from './views/Dashboard.tsx';
 import { Insights } from './views/Insights.tsx';
+import { Benchmark } from './views/Benchmark.tsx';
 import { ToastProvider } from './components/Toast.tsx';
 import { colors, fontFamily } from './theme.ts';
 import { api } from './api.ts';
@@ -14,33 +15,34 @@ import { api } from './api.ts';
 interface SidebarCounts {
   toReview: number;
   approved: number;
+  recommendations: number;
 }
 
-function Sidebar() {
-  const [counts, setCounts] = useState<SidebarCounts>({ toReview: 0, approved: 0 });
+function Sidebar({ benchmarkEnabled }: { benchmarkEnabled: boolean }) {
+  const [counts, setCounts] = useState<SidebarCounts>({ toReview: 0, approved: 0, recommendations: 0 });
 
   useEffect(() => {
-    api.stats()
-      .then(s => setCounts({
+    const loadStats = () => api.stats()
+      .then(s => setCounts(c => ({
+        ...c,
         toReview: (s.by_status['new'] ?? 0) + (s.by_status['shortlisted'] ?? 0),
         approved: s.by_status['approved'] ?? 0,
-      }))
+      })))
       .catch(() => {});
-    // Refresh counts periodically
-    const iv = setInterval(() => {
-      api.stats()
-        .then(s => setCounts({
-          toReview: (s.by_status['new'] ?? 0) + (s.by_status['shortlisted'] ?? 0),
-          approved: s.by_status['approved'] ?? 0,
-        }))
-        .catch(() => {});
-    }, 30_000);
+    // The advisor's recommendation count nudges the Insights tab — fetched once
+    // (it changes slowly), while the cheap session stats refresh periodically.
+    api.advisor({ days: 7 })
+      .then(a => setCounts(c => ({ ...c, recommendations: a.recommendations.length })))
+      .catch(() => {});
+    loadStats();
+    const iv = setInterval(loadStats, 30_000);
     return () => clearInterval(iv);
   }, []);
 
   const NAV_ITEMS = [
     { to: '/dashboard', label: 'Dashboard', badge: null },
-    { to: '/insights', label: 'Insights', badge: null },
+    { to: '/insights', label: 'Insights', badge: counts.recommendations > 0 ? counts.recommendations : null },
+    ...(benchmarkEnabled ? [{ to: '/benchmark', label: 'Benchmark', badge: null }] : []),
     { to: '/search', label: 'Search', badge: null },
     { to: '/', label: 'Sessions', badge: counts.toReview > 0 ? counts.toReview : null },
     { to: '/share', label: 'Share', badge: null },
@@ -119,6 +121,16 @@ function Sidebar() {
 const SCORING_WARMUP_DECLINED_KEY = 'cj.scoringWarmupDeclined';
 
 export default function App() {
+  // Gate the Benchmark tab on a config flag (default on). Initialised to true so
+  // the common (enabled) case never flashes; only an explicitly-disabled install
+  // briefly shows it before /api/features resolves on localhost.
+  const [benchmarkEnabled, setBenchmarkEnabled] = useState(true);
+  useEffect(() => {
+    api.features()
+      .then(f => setBenchmarkEnabled(f.benchmark_tab_enabled))
+      .catch(() => {});
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     const timer = window.setTimeout(async () => {
@@ -164,7 +176,7 @@ export default function App() {
           color: colors.gray900,
           WebkitFontSmoothing: 'antialiased',
         }}>
-          <Sidebar />
+          <Sidebar benchmarkEnabled={benchmarkEnabled} />
           <main style={{ flex: 1, overflow: 'auto', background: colors.white }}>
             <Routes>
               <Route path="/dashboard" element={<Dashboard />} />
@@ -174,6 +186,7 @@ export default function App() {
               <Route path="/session/:id" element={<SessionDetail />} />
               <Route path="/bundles" element={<Navigate to="/share" replace />} />
               <Route path="/policies" element={<Navigate to="/share/rules" replace />} />
+              <Route path="/benchmark" element={benchmarkEnabled ? <Benchmark /> : <Navigate to="/dashboard" replace />} />
               <Route path="/share" element={<Share />} />
               <Route path="/share/rules" element={<Policies />} />
             </Routes>
