@@ -219,6 +219,13 @@ def trigger_scoring_warmup(
     if scanner is None:
         return {"status": "disabled", "reason": "Background scanner is not running."}
 
+    # A user decline must gate EVERY entry point (scanner loop, initial scan,
+    # manual scan, HTTP handler) — not just the browser prompt. Once a backend
+    # is confirmed (env var or prior CLI/Settings), scoring would otherwise
+    # auto-start on every scan regardless of the UI choice.
+    if load_config().get("scoring_warmup_declined"):
+        return {"status": "declined", "reason": "Background auto-scoring is turned off in settings."}
+
     backend = _confirmed_scoring_backend()
     suggested = (requested_backend or "").strip().lower() or None
     if suggested is not None and suggested not in SUPPORTED_BACKENDS:
@@ -396,6 +403,14 @@ class Scanner:
 
                 scored = 0
                 for s in sessions:
+                    # Honor a mid-batch opt-out: if the user turns off background
+                    # scoring (Settings / decline) while this batch is running,
+                    # stop before egressing the next trace. Re-read config each
+                    # iteration — it's the source of truth and cheap relative to a
+                    # scoring call.
+                    if load_config().get("scoring_warmup_declined"):
+                        logger.info("Automatic scoring stopped: background scoring turned off")
+                        break
                     sid = s["session_id"]
                     try:
                         result = score_session(conn, sid, backend=backend)
@@ -555,7 +570,9 @@ def _benchmark_is_stale(benchmark: dict | None, *, days: int = _BENCHMARK_STALE_
     return (datetime.now(timezone.utc) - gen).total_seconds() > days * 86400
 
 
-def _run_benchmark_generation(benchmark_id: str, week_slice) -> None:
+def _run_benchmark_generation(
+    benchmark_id: str, week_slice, backend: str = "auto", model: str | None = None,
+) -> None:
     """Background worker: run the deep pipeline against a pre-selected slice and
     finalize (or mark failed) the placeholder row. Always releases the gen lock.
 
@@ -576,7 +593,7 @@ def _run_benchmark_generation(benchmark_id: str, week_slice) -> None:
 
         try:
             benchmark = generate_benchmark(
-                conn, week_slice=week_slice, backend="auto", progress=progress)
+                conn, week_slice=week_slice, backend=backend, model=model, progress=progress)
             store.finalize_benchmark(conn, benchmark_id, benchmark)
         except Exception as exc:
             logger.warning("benchmark generation failed for %s: %s", benchmark_id, exc)
@@ -2057,6 +2074,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._handle_list_allowlist()
         elif path == "/api/findings/allowlist":
             self._handle_list_findings_allowlist()
+        elif path == "/api/config":
+            self._handle_get_config()
         elif path == "/api/features":
             self._handle_features()
         elif path == "/api/benchmarks":
@@ -2133,6 +2152,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._handle_add_findings_allowlist()
         elif path == "/api/scoring/warmup":
             self._handle_scoring_warmup()
+        elif path == "/api/config":
+            self._handle_update_config()
         elif path == "/api/scan":
             force = parse_qs(parsed.query).get("force", [""])[0] in ("1", "true")
             self._handle_trigger_scan(force=force)
@@ -2575,8 +2596,15 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         from ..benchmark.select import select_week_failures
 
         body = _read_body(self) or {}
-        window = int(body.get("window_days", 7))
-        cap = int(body.get("cap", 15))
+        # window/cap/backend/model now come from the UI controls — clamp the
+        # numerics to sane bounds and default backend to auto-detect.
+        window = max(1, min(int(body.get("window_days", 7) or 7), 90))
+        cap = max(1, min(int(body.get("cap", 15) or 15), 50))
+        backend = str(body.get("backend") or "auto").strip().lower() or "auto"
+        model = (str(body.get("model")).strip() or None) if body.get("model") else None
+        if backend != "auto" and backend not in SUPPORTED_BACKENDS:
+            _json_response(self, {"error": f"Unsupported benchmark backend: {backend}"}, 400)
+            return
 
         if not _BENCHMARK_GEN_LOCK.acquire(blocking=False):
             _json_response(self, {"status": "busy",
@@ -2597,7 +2625,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 conn.close()
             try:
                 threading.Thread(
-                    target=_run_benchmark_generation, args=(bid, sl), daemon=True).start()
+                    target=_run_benchmark_generation, args=(bid, sl, backend, model),
+                    daemon=True).start()
             except Exception as exc:
                 # Thread didn't start, so the worker won't run (and won't release
                 # the lock or finalize the row) — mark it failed here and bail.
@@ -2845,7 +2874,77 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         config = load_config()
         _json_response(self, {
             "benchmark_tab_enabled": bool(config.get("benchmark_tab_enabled", True)),
+            "scoring_warmup_declined": bool(config.get("scoring_warmup_declined", False)),
         })
+
+    def _handle_get_config(self) -> None:
+        """Return the UI-editable config subset plus the valid option lists.
+
+        Only non-sensitive knobs are exposed — never tokens, attestations, or
+        verification state.
+        """
+        from ..config import load_config
+        from ..cli import EXPLICIT_SOURCE_CHOICES
+        from ..scoring.scoring import SUPPORTED_SCORING_BACKENDS
+        config = load_config()
+        # 'both' is deprecated and hidden from the picker, but surface it if it is
+        # the currently-stored value so the select shows the real value rather
+        # than a misleading "Select a source…" placeholder.
+        stored_source = config.get("source")
+        source_choices = sorted(
+            c for c in EXPLICIT_SOURCE_CHOICES if c != "both" or stored_source == "both"
+        )
+        _json_response(self, {
+            "source": config.get("source"),
+            "projects_confirmed": bool(config.get("projects_confirmed", False)),
+            "ai_pii_review_enabled": bool(config.get("ai_pii_review_enabled", False)),
+            "scorer_backend": config.get("scorer_backend"),
+            "scorer_backend_confirmed_at": config.get("scorer_backend_confirmed_at"),
+            "benchmark_tab_enabled": bool(config.get("benchmark_tab_enabled", True)),
+            "scoring_warmup_declined": bool(config.get("scoring_warmup_declined", False)),
+            "source_choices": source_choices,
+            "scorer_backend_choices": [b for b in SUPPORTED_SCORING_BACKENDS if b != "auto"],
+            "scorer_backend_detected": _suggest_scoring_backend(),
+        })
+
+    def _handle_update_config(self) -> None:
+        """Write a whitelisted config subset via cli.configure() so all the
+        append/merge/confirm invariants stay identical to the CLI path."""
+        from ..cli import configure, EXPLICIT_SOURCE_CHOICES
+        from ..scoring.scoring import SUPPORTED_SCORING_BACKENDS
+        body = _read_body(self) or {}
+
+        kwargs: dict[str, Any] = {}
+        if body.get("source") is not None:
+            src = str(body["source"]).strip().lower()
+            if src not in EXPLICIT_SOURCE_CHOICES:
+                _json_response(self, {"error": f"Invalid source: {src}"}, 400)
+                return
+            kwargs["source"] = src
+        if body.get("scorer_backend") is not None:
+            sb = str(body["scorer_backend"]).strip().lower()
+            if sb != "none" and sb not in SUPPORTED_SCORING_BACKENDS:
+                _json_response(self, {"error": f"Invalid scorer backend: {sb}"}, 400)
+                return
+            kwargs["scorer_backend"] = sb
+        if body.get("confirm_projects"):
+            kwargs["confirm_projects"] = True
+        if body.get("ai_pii_review_enabled") is not None:
+            kwargs["ai_pii_review"] = bool(body["ai_pii_review_enabled"])
+        if body.get("benchmark_tab_enabled") is not None:
+            kwargs["benchmark_tab_enabled"] = bool(body["benchmark_tab_enabled"])
+        if body.get("scoring_warmup_declined") is not None:
+            kwargs["scoring_warmup_declined"] = bool(body["scoring_warmup_declined"])
+
+        if not kwargs:
+            _json_response(self, {"error": "No recognized config fields"}, 400)
+            return
+        try:
+            configure(quiet=True, **kwargs)
+        except Exception as exc:
+            _json_response(self, {"error": str(exc)}, 500)
+            return
+        self._handle_get_config()  # echo back the new state
 
     def _handle_list_allowlist(self) -> None:
         """Return current allowlist entries from config."""
@@ -2921,11 +3020,31 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
 
     def _handle_scoring_warmup(self) -> None:
         """Start background scoring for share-ready recommendations."""
+        from ..config import load_config, save_config
         body = _read_body(self) or {}
+
+        # Persist an explicit decline server-side so it sticks across reloads,
+        # browsers, and the background scanner (not just localStorage).
+        if body.get("decline"):
+            cfg = load_config()
+            cfg["scoring_warmup_declined"] = True
+            save_config(cfg)
+            _json_response(self, {"status": "declined"})
+            return
+
+        confirm = bool(body.get("confirm_backend") or body.get("confirm"))
+        if confirm:
+            # Confirm must win over a stale decline — clear the flag BEFORE
+            # trigger_scoring_warmup, whose top-of-function gate would otherwise
+            # swallow the very confirm that should turn scoring on.
+            cfg = load_config()
+            if cfg.pop("scoring_warmup_declined", None) is not None:
+                save_config(cfg)
+
         scanner = getattr(self.server, "_scanner", None)
         payload = trigger_scoring_warmup(
             scanner,
-            confirm_backend=bool(body.get("confirm_backend") or body.get("confirm")),
+            confirm_backend=confirm,
             requested_backend=body.get("backend"),
         )
         _json_response(self, payload)
@@ -3605,6 +3724,11 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(data)))
             if content_type == "text/html":
+                # index.html references content-hashed asset filenames, so it must
+                # never be cached: a stale copy pins the browser to an old bundle
+                # after a rebuild (the dev-staleness trap that `--reload` targets).
+                # Hashed assets under /assets/* stay implicitly cacheable.
+                self.send_header("Cache-Control", "no-store, must-revalidate")
                 self._maybe_set_api_token_cookie()
             self.end_headers()
             self.wfile.write(data)
@@ -3955,6 +4079,32 @@ def run_with_reload(open_browser: bool = True) -> None:
         _terminate_child(proc)
 
 
+def _try_serve_ipv6_loopback(port: int, scanner: "Scanner") -> ThreadingHTTPServer | None:
+    """Start a companion IPv6 (``::1``) loopback server on ``port``, serving in a
+    daemon thread with the same handler/scanner as the primary IPv4 server.
+
+    Returns the server, or ``None`` if IPv6 loopback isn't available (no IPv6
+    stack, or the port is already taken on ``::1``) — the IPv4 socket still
+    serves, so this is best-effort.
+    """
+    import socket as _socket
+
+    class _IPv6ThreadingHTTPServer(ThreadingHTTPServer):
+        address_family = _socket.AF_INET6
+
+    try:
+        v6 = _IPv6ThreadingHTTPServer(("::1", port), WorkbenchHandler)
+    except OSError as exc:
+        logger.info(
+            "IPv6 loopback (::1) bind skipped (%s); reach the workbench via 127.0.0.1",
+            exc,
+        )
+        return None
+    v6._scanner = scanner  # type: ignore[attr-defined]
+    threading.Thread(target=v6.serve_forever, daemon=True).start()
+    return v6
+
+
 def run_server(
     port: int = DEFAULT_PORT,
     open_browser: bool = True,
@@ -3969,13 +4119,22 @@ def run_server(
 
     scanner = Scanner(source_filter=source_filter)
 
-    # Start HTTP server first so it's responsive immediately
+    # Start HTTP server first so it's responsive immediately. The primary socket
+    # is IPv4 127.0.0.1 — what the CLI health probe, curl, and SSH `-L` tunnels
+    # expect.
     try:
         server = ThreadingHTTPServer(("127.0.0.1", port), WorkbenchHandler)
     except OSError:
         server = ThreadingHTTPServer(("127.0.0.1", 0), WorkbenchHandler)
         port = server.server_address[1]
     server._scanner = scanner  # type: ignore[attr-defined]
+
+    # Companion IPv6 loopback socket on the same port. Browsers resolve
+    # `localhost` to ::1 (IPv6) first and don't all fall back to IPv4, so an
+    # IPv4-only daemon leaves the workbench unreachable via localhost on
+    # IPv6-preferring systems. Each family is its own ::1 / 127.0.0.1 loopback
+    # socket — nothing is exposed beyond the local host.
+    v6_server = _try_serve_ipv6_loopback(port, scanner)
 
     url = f"http://localhost:{port}/"
     logger.info("Workbench running at %s", url)
@@ -4029,3 +4188,5 @@ def run_server(
     finally:
         scanner.stop()
         server.shutdown()
+        if v6_server is not None:
+            v6_server.shutdown()

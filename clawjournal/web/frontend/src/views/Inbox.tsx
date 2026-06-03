@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import type { Session, Stats } from '../types.ts';
 import { api } from '../api.ts';
 import { useToast } from '../components/Toast.tsx';
@@ -7,10 +7,14 @@ import { ConfirmDialog } from '../components/ConfirmDialog.tsx';
 import { Spinner } from '../components/Spinner.tsx';
 import { LABELS } from '../components/BadgeChip.tsx';
 import { GettingStartedGuide } from '../components/GettingStartedGuide.tsx';
-import { colors, selectStyle } from '../theme.ts';
+import { ZeroState } from '../components/ZeroState.tsx';
+import { colors, selectStyle, btnPrimary, btnDanger, btnSecondary } from '../theme.ts';
 
 const PAGE_SIZE = 10;
-const TYPE_CHIP_PREVIEW_LIMIT = 16;
+// Show only the top few task-type chips by default; the long tail collapses
+// behind a "More (N)" toggle. Keeps the toolbar to one calm row instead of ~17
+// chips wrapping across the viewport.
+const TYPE_CHIP_PREVIEW_LIMIT = 6;
 const GETTING_STARTED_DISMISSED_KEY = 'cj.gettingStartedGuideV2Dismissed';
 
 function failureBadge(score: number | null): string {
@@ -106,6 +110,8 @@ function hexAlpha(hex: string, alpha: number): string {
 
 export function Inbox() {
   const { toast } = useToast();
+  const navigate = useNavigate();
+  const [searchBox, setSearchBox] = useState('');
   const [sessions, setSessions] = useState<Session[]>([]);
   const [stats, setStats] = useState<Stats>({ total: 0, by_status: {}, by_source: {}, by_project: {}, by_task_type: {} });
   const [showGettingStartedGuide, setShowGettingStartedGuide] = useState(() => {
@@ -116,6 +122,9 @@ export function Inbox() {
     }
   });
   const [loading, setLoading] = useState(false);
+  // Distinguishes "not yet loaded" from "genuinely empty" so the zero-state /
+  // empty-state don't flash for a frame before the first fetch resolves.
+  const [loaded, setLoaded] = useState(false);
   const [offset, setOffset] = useState(0);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [expandedMessages, setExpandedMessages] = useState<Record<string, Array<{ role: string; content: string; tool_uses?: Array<{ tool: string }> }>>>({});
@@ -179,7 +188,7 @@ export function Inbox() {
     } catch (e) {
       toast(e instanceof Error ? e.message : 'Failed to load sessions', 'error');
     }
-    finally { setLoading(false); }
+    finally { setLoading(false); setLoaded(true); }
   }, [sort, sourceFilter, projectFilter, typeFilter, recoveryFilter, attributionFilter, modeFilter, toast]);
 
   useEffect(() => {
@@ -238,16 +247,22 @@ export function Inbox() {
 
   const handleBulkAction = async (action: 'approved' | 'blocked') => {
     const ids = [...selectedIds];
-    try {
-      await Promise.all(ids.map(id => api.sessions.update(id, { status: action })));
-      setSessions(prev => prev.filter(s => !selectedIds.has(s.session_id)));
-      setSelectedIds(new Set());
-      loadStats();
-      toast(`${ids.length} session${ids.length > 1 ? 's' : ''} ${action === 'approved' ? 'approved' : 'skipped'}`, 'success');
-    } catch (e) {
-      toast(e instanceof Error ? e.message : 'Bulk action failed', 'error');
-    }
+    const verb = action === 'approved' ? 'approved' : 'skipped';
+    // Per-item settle so one failed update doesn't strand the rest: remove only
+    // the ones that actually succeeded and keep the failures selected.
+    const results = await Promise.allSettled(ids.map(id => api.sessions.update(id, { status: action })));
+    const okIds = new Set(ids.filter((_, i) => results[i].status === 'fulfilled'));
+    const failed = ids.length - okIds.size;
+    setSessions(prev => prev.filter(s => !okIds.has(s.session_id)));
+    setSelectedIds(prev => new Set([...prev].filter(id => !okIds.has(id))));
+    loadStats();
     setConfirm(null);
+    if (okIds.size > 0) {
+      toast(`${okIds.size} session${okIds.size > 1 ? 's' : ''} ${verb}`, 'success');
+    }
+    if (failed > 0) {
+      toast(`${failed} session${failed > 1 ? 's' : ''} failed to update`, 'error');
+    }
   };
 
   const handleExpand = async (sessionId: string) => {
@@ -307,6 +322,17 @@ export function Inbox() {
     } catch { /* ignore */ }
   };
 
+  const hasActiveFilter = !!(typeFilter || sourceFilter || projectFilter
+    || recoveryFilter || attributionFilter || modeFilter);
+  const clearAllFilters = () => {
+    setTypeFilter(null);
+    setSourceFilter(null);
+    setProjectFilter(null);
+    setRecoveryFilter(null);
+    setAttributionFilter(null);
+    setModeFilter(null);
+  };
+
   return (
     <div style={{ padding: '14px 20px' }}>
       {/* Header */}
@@ -316,6 +342,25 @@ export function Inbox() {
           <span style={{ fontSize: 13, color: colors.gray400 }}>{stats.total} sessions</span>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <input
+            type="search"
+            value={searchBox}
+            onChange={e => setSearchBox(e.target.value)}
+            onKeyDown={e => {
+              // Full-text search lives in the dedicated results view; the toolbar
+              // box is just the entry point and hands the query off via ?q=.
+              if (e.key === 'Enter' && searchBox.trim()) {
+                navigate(`/search?q=${encodeURIComponent(searchBox.trim())}`);
+              }
+            }}
+            placeholder="Search…"
+            aria-label="Search sessions"
+            style={{
+              ...selectStyle,
+              width: 150,
+              cursor: 'text',
+            }}
+          />
           <select value={sort} onChange={e => setSort(e.target.value)} style={selectStyle}>
             <option value="ai_failure_value_score:desc">Top failures</option>
             <option value="ai_quality_score:desc">Highest productivity</option>
@@ -331,8 +376,40 @@ export function Inbox() {
         </div>
       </div>
 
+      {loaded && stats.total === 0 && sessions.length === 0 && !typeFilter && (
+        <ZeroState />
+      )}
+
       {showGettingStartedGuide && stats.total > 0 && sessions.length > 0 && !typeFilter && (
         <GettingStartedGuide stats={stats} onDismiss={dismissGettingStartedGuide} />
+      )}
+
+      {selectedIds.size > 0 && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 10,
+          padding: '8px 12px', marginBottom: 8,
+          background: colors.primary50, border: `1px solid ${colors.primary200}`, borderRadius: 8,
+        }}>
+          <span style={{ fontSize: 13, fontWeight: 600, color: colors.gray800 }}>
+            {selectedIds.size} selected
+          </span>
+          <button onClick={toggleSelectAll} style={{ ...btnSecondary, padding: '4px 10px', fontSize: 12 }}>
+            {selectedIds.size === sessions.length ? 'Clear' : 'Select all'}
+          </button>
+          <div style={{ flex: 1 }} />
+          <button
+            onClick={() => setConfirm({ action: 'approved', ids: [...selectedIds] })}
+            style={{ ...btnPrimary, padding: '4px 12px', fontSize: 12, fontWeight: 600 }}
+          >
+            Approve
+          </button>
+          <button
+            onClick={() => setConfirm({ action: 'blocked', ids: [...selectedIds] })}
+            style={{ ...btnDanger, padding: '4px 12px', fontSize: 12, fontWeight: 600 }}
+          >
+            Skip
+          </button>
+        </div>
       )}
 
       {showFilters && (
@@ -476,32 +553,35 @@ export function Inbox() {
 
       {/* spacer */}
 
-      {/* All reviewed state */}
-      {sessions.length === 0 && !loading && (
+      {/* All-reviewed / filtered-empty state. The brand-new-install case
+          (stats.total === 0) is handled by <ZeroState /> above. */}
+      {loaded && sessions.length === 0 && !loading && stats.total > 0 && (
         <div style={{
           background: colors.white, border: `1px solid ${colors.gray200}`, borderRadius: '8px',
           padding: '24px 20px', textAlign: 'center', marginTop: '12px',
         }}>
-          <h3 style={{ margin: '0 0 4px', fontSize: '15px', fontWeight: 600, color: colors.green500 }}>
-            {typeFilter ? `No "${LABELS[typeFilter] ?? typeFilter}" sessions found` : 'No sessions yet'}
+          <h3 style={{ margin: '0 0 4px', fontSize: '15px', fontWeight: 600, color: hasActiveFilter ? colors.gray700 : colors.green500 }}>
+            {hasActiveFilter
+              ? (typeFilter ? `No "${LABELS[typeFilter] ?? typeFilter}" sessions found` : 'No sessions match your filters')
+              : 'You’re all caught up'}
           </h3>
           <p style={{ margin: '0 0 10px', fontSize: '13px', color: colors.gray500 }}>
-            {typeFilter
-              ? 'Try selecting a different type or clear the filter.'
-              : 'Run clawjournal scan to discover sessions.'}
+            {hasActiveFilter
+              ? 'Try adjusting or clearing your filters.'
+              : 'Every session has been reviewed. Open Share to package approved traces, or run clawjournal scan to pick up new ones.'}
           </p>
-          {typeFilter && (
+          {hasActiveFilter && (
             <button
-              onClick={() => setTypeFilter(null)}
+              onClick={clearAllFilters}
               style={{
                 display: 'inline-block', padding: '7px 18px', background: colors.primary500, color: colors.white,
                 borderRadius: '6px', fontSize: '13px', fontWeight: 600, border: 'none', cursor: 'pointer',
               }}
             >
-              Show all sessions
+              Clear filters
             </button>
           )}
-          {!typeFilter && (stats.by_status['approved'] ?? 0) > 0 && (
+          {!hasActiveFilter && (stats.by_status['approved'] ?? 0) > 0 && (
             <Link to="/share" style={{
               display: 'inline-block', padding: '7px 18px', background: colors.primary500, color: colors.white,
               borderRadius: '6px', fontSize: '13px', fontWeight: 600, textDecoration: 'none',
@@ -543,6 +623,14 @@ export function Inbox() {
                 display: 'flex', alignItems: 'center', gap: '8px',
                 padding: '7px 10px', cursor: 'pointer',
               }} onClick={() => handleExpand(s.session_id)}>
+                <input
+                  type="checkbox"
+                  checked={isSelected}
+                  aria-label={`Select session: ${s.display_title || 'Untitled'}`}
+                  onClick={e => e.stopPropagation()}
+                  onChange={() => toggleSelect(s.session_id)}
+                  style={{ flexShrink: 0, cursor: 'pointer' }}
+                />
                 {/* Failure + productivity scores */}
                 <div style={{
                   display: 'flex', flexDirection: 'column', gap: 1,
@@ -552,8 +640,8 @@ export function Inbox() {
                     {failureBadge(s.ai_failure_value_score)}
                   </span>
                   {s.ai_quality_score != null && (
-                    <span style={{ color: colors.gray400, fontSize: 11, fontWeight: 600 }}>
-                      P {s.ai_quality_score}/5
+                    <span title="Productivity score" style={{ color: colors.gray400, fontSize: 11, fontWeight: 600 }}>
+                      Prod {s.ai_quality_score}/5
                     </span>
                   )}
                 </div>

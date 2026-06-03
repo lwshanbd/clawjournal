@@ -814,9 +814,22 @@ export function Share() {
     </div>;
   }
 
+  // Drop the Submit pill when hosted submission isn't available, so the stepper
+  // doesn't advertise a step the flow will skip (Package → Done). Only filter
+  // once the destination probe has resolved — show the full STEPS while loading
+  // to avoid a flicker, matching the routing effects above. The STEPS const
+  // itself is unchanged (helpers.ts still uses it for full-flow step indexing).
+  const canSubmit = !!shareDestination?.daemon_upload_supported && !!shareDestination?.submissions_open;
+  const visibleSteps = (!destinationLoading && !canSubmit)
+    // Keep the current step even if it's 'submit' (e.g. a Submit deep-link
+    // resolving to a non-submittable destination) so the stepper never
+    // highlights nothing for the frame before the reroute to 'done'.
+    ? STEPS.filter(s => s.key !== 'submit' || s.key === activeStep)
+    : STEPS;
+
   const stepperHeader = (
     <Stepper
-      steps={STEPS}
+      steps={visibleSteps}
       activeKey={activeStep}
       completedKeys={completedKeys}
       onStepClick={onStepClick}
