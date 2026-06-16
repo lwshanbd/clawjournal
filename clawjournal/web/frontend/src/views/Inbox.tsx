@@ -10,7 +10,6 @@ import { GettingStartedGuide } from '../components/GettingStartedGuide.tsx';
 import { ZeroState } from '../components/ZeroState.tsx';
 import { colors, selectStyle, btnPrimary, btnDanger, btnSecondary } from '../theme.ts';
 
-const PAGE_SIZE = 10;
 // Show only the top few task-type chips by default; the long tail collapses
 // behind a "More (N)" toggle. Keeps the toolbar to one calm row instead of ~17
 // chips wrapping across the viewport.
@@ -157,6 +156,8 @@ export function Inbox() {
   // empty-state don't flash for a frame before the first fetch resolves.
   const [loaded, setLoaded] = useState(false);
   const [offset, setOffset] = useState(0);
+  const [pageSize, setPageSize] = useState(10);
+  const [hasMore, setHasMore] = useState(false);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [expandedMessages, setExpandedMessages] = useState<Record<string, Array<{ role: string; content: string; tool_uses?: Array<{ tool: string }> }>>>({});
   const [sort, setSort] = useState('ai_failure_value_score:desc');
@@ -187,6 +188,7 @@ export function Inbox() {
   expandedIdRef.current = expandedId;
   const expandedMsgsRef = useRef(expandedMessages);
   expandedMsgsRef.current = expandedMessages;
+  const loadRequestSeqRef = useRef(0);
   // Session ids with an in-flight redacted-content fetch (single-flight guard).
   const loadingIdsRef = useRef<Set<string>>(new Set());
 
@@ -201,6 +203,8 @@ export function Inbox() {
   }, []);
 
   const loadSessions = useCallback(async (currentOffset: number, append: boolean) => {
+    const requestSeq = loadRequestSeqRef.current + 1;
+    loadRequestSeqRef.current = requestSeq;
     setLoading(true);
     const [sortField, sortOrder] = sort.split(':');
     try {
@@ -214,23 +218,34 @@ export function Inbox() {
         failure_mode: modeFilter,
         sort: sortField,
         order: sortOrder,
-        limit: PAGE_SIZE,
+        limit: pageSize + 1,
         offset: currentOffset,
       });
-      setSessions(prev => append ? [...prev, ...data] : data);
+      if (requestSeq !== loadRequestSeqRef.current) return;
+      const visibleRows = data.slice(0, pageSize);
+      setSessions(prev => append ? [...prev, ...visibleRows] : visibleRows);
+      setOffset(currentOffset);
+      setHasMore(data.length > pageSize);
     } catch (e) {
+      if (requestSeq !== loadRequestSeqRef.current) return;
       toast(e instanceof Error ? e.message : 'Failed to load sessions', 'error');
     }
-    finally { setLoading(false); setLoaded(true); }
-  }, [sort, sourceFilter, projectFilter, typeFilter, recoveryFilter, attributionFilter, modeFilter, toast]);
+    finally {
+      if (requestSeq === loadRequestSeqRef.current) {
+        setLoading(false);
+        setLoaded(true);
+      }
+    }
+  }, [sort, sourceFilter, projectFilter, typeFilter, recoveryFilter, attributionFilter, modeFilter, pageSize, toast]);
 
   useEffect(() => {
     setOffset(0);
+    setHasMore(false);
     setSelectedIds(new Set());
     setFocusIndex(-1);
     loadSessions(0, false);
     loadStats();
-  }, [sort, sourceFilter, projectFilter, typeFilter, recoveryFilter, attributionFilter, modeFilter, loadSessions, loadStats]);
+  }, [sort, sourceFilter, projectFilter, typeFilter, recoveryFilter, attributionFilter, modeFilter, pageSize, loadSessions, loadStats]);
 
   // Keyboard navigation — uses refs to avoid stale closures
   useEffect(() => {
@@ -410,6 +425,17 @@ export function Inbox() {
             <option value="ai_quality_score:desc">Highest productivity</option>
             <option value="start_time:desc">Newest first</option>
             <option value="start_time:asc">Oldest first</option>
+          </select>
+          <select
+            value={pageSize}
+            onChange={e => setPageSize(Number(e.target.value))}
+            aria-label="Sessions per page"
+            style={selectStyle}
+          >
+            <option value={10}>10 / page</option>
+            <option value={20}>20 / page</option>
+            <option value={50}>50 / page</option>
+            <option value={100}>100 / page</option>
           </select>
           <button
             onClick={() => setShowFilters(!showFilters)}
@@ -788,10 +814,10 @@ export function Inbox() {
       </div>
 
       {/* Load more */}
-      {sessions.length >= PAGE_SIZE && sessions.length > 0 && (
+      {hasMore && sessions.length > 0 && (
         <div style={{ textAlign: 'center', marginTop: '8px' }}>
           <button
-            onClick={() => { const n = offset + PAGE_SIZE; setOffset(n); loadSessions(n, true); }}
+            onClick={() => { void loadSessions(offset + pageSize, true); }}
             disabled={loading}
             style={{
               padding: '5px 18px', background: colors.gray100, color: colors.gray700, border: `1px solid ${colors.gray300}`,
