@@ -33,7 +33,10 @@ from ..scoring.backends import (
     PERMANENT_BACKEND_FAILURE_MARKERS,
     SUPPORTED_BACKENDS,
     detect_available_backend,
+    installed_fallback_chain,
+    is_backend_unavailable_error,
     require_backend_command,
+    resolve_backend,
 )
 from ..scoring.overrides import (
     failure_evidence_from_detail,
@@ -205,6 +208,23 @@ def _scoring_backend_payload(backend: str | None) -> dict[str, Any]:
     }
 
 
+def _fallback_chain_has_installed_backend(backend: str) -> bool:
+    """True when `backend` or one of its fallback backends is runnable."""
+    try:
+        chain = installed_fallback_chain(resolve_backend(backend))
+    except Exception:  # noqa: BLE001
+        chain = [backend]
+    for candidate in chain:
+        if candidate not in SUPPORTED_BACKENDS:
+            continue
+        try:
+            require_backend_command(candidate)
+        except RuntimeError:
+            continue
+        return True
+    return False
+
+
 def trigger_scoring_warmup(
     scanner: "Scanner | None",
     *,
@@ -238,7 +258,8 @@ def trigger_scoring_warmup(
         try:
             require_backend_command(backend)
         except RuntimeError as exc:
-            return {"status": "disabled", "reason": str(exc), **_scoring_backend_payload(backend)}
+            if not _fallback_chain_has_installed_backend(backend):
+                return {"status": "disabled", "reason": str(exc), **_scoring_backend_payload(backend)}
         if not confirm_backend and _env_scoring_backend() is None:
             return {
                 "status": "needs_confirmation",
@@ -250,7 +271,8 @@ def trigger_scoring_warmup(
     try:
         require_backend_command(backend)
     except RuntimeError as exc:
-        return {"status": "disabled", "reason": str(exc), **_scoring_backend_payload(backend)}
+        if not _fallback_chain_has_installed_backend(backend):
+            return {"status": "disabled", "reason": str(exc), **_scoring_backend_payload(backend)}
 
     return scanner.trigger_auto_score(limit=limit, backend=backend)
 
@@ -398,6 +420,17 @@ class Scanner:
                 if not sessions:
                     return 0
 
+                # Build a fallback chain so a backend that runs out mid-batch
+                # (e.g. codex out of credits / not logged in) is replaced by the
+                # next installed backend instead of failing every remaining trace.
+                # If nothing resolves up front, fall through to the per-session
+                # handling below (which arms the permanent-failure breaker).
+                try:
+                    chain = installed_fallback_chain(resolve_backend(backend))
+                except Exception:  # noqa: BLE001
+                    chain = [backend]
+                dead: set[str] = set()
+
                 scored = 0
                 for s in sessions:
                     # Honor a mid-batch opt-out: if the user turns off background
@@ -409,23 +442,44 @@ class Scanner:
                         logger.info("Automatic scoring stopped: background scoring turned off")
                         break
                     sid = s["session_id"]
-                    try:
-                        result = score_session(conn, sid, backend=backend)
-                    except RuntimeError as exc:
-                        message = str(exc)
-                        if any(marker in message for marker in PERMANENT_BACKEND_FAILURE_MARKERS):
-                            self._auto_score_disabled_reason = message
-                            logger.info("Automatic scoring disabled: %s", message)
+                    while True:
+                        active = next((b for b in chain if b not in dead), None)
+                        if active is None:
+                            self._auto_score_disabled_reason = (
+                                self._auto_score_disabled_reason
+                                or "All scoring backends are unavailable")
+                            logger.info("Automatic scoring disabled: %s",
+                                        self._auto_score_disabled_reason)
                             break
-                        logger.warning("Automatic scoring failed for %s: %s", sid, message)
-                        continue
-                    except Exception:
-                        logger.exception("Automatic scoring crashed for %s", sid)
-                        continue
+                        try:
+                            result = score_session(conn, sid, backend=active)
+                        except RuntimeError as exc:
+                            message = str(exc)
+                            backend_dead = is_backend_unavailable_error(message) or any(
+                                m in message for m in PERMANENT_BACKEND_FAILURE_MARKERS)
+                            if backend_dead:
+                                dead.add(active)
+                                if next((b for b in chain if b not in dead), None) is not None:
+                                    logger.info("Scoring backend '%s' unavailable (%s); "
+                                                "switching to '%s'", active, message,
+                                                next(b for b in chain if b not in dead))
+                                    continue  # retry this session on the next backend
+                                self._auto_score_disabled_reason = message
+                                logger.info("Automatic scoring disabled: %s", message)
+                                break
+                            logger.warning("Automatic scoring failed for %s: %s", sid, message)
+                            break
+                        except Exception:
+                            logger.exception("Automatic scoring crashed for %s", sid)
+                            break
+                        else:
+                            if _persist_scoring_result(conn, sid, result):
+                                scored += 1
+                                _maybe_create_trace_note(conn, sid)
+                            break
 
-                    if _persist_scoring_result(conn, sid, result):
-                        scored += 1
-                        _maybe_create_trace_note(conn, sid)
+                    if self._auto_score_disabled_reason:
+                        break  # stop the batch — no usable backend remains
 
                 return scored
             finally:
