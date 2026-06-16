@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -20,9 +21,16 @@ logger = logging.getLogger(__name__)
 
 SUPPORTED_BACKENDS = ("claude", "codex", "hermes", "openclaw")
 BACKEND_CHOICES = ("auto", *SUPPORTED_BACKENDS)
+# When no current agent is detected (e.g. a plain terminal), pick the first
+# *installed* backend in this order. codex is first (cheaper); if it is missing
+# or unusable, scoring falls back to the next installed backend at call time.
 AUTO_BACKEND_FALLBACK_ORDER = ("codex", "claude", "hermes", "openclaw")
 DEFAULT_CLAUDE_MODEL = "claude-haiku-4-5"
-DEFAULT_CODEX_MODEL = "gpt-5.4-mini"
+DEFAULT_CODEX_MODEL = "gpt-5.5"
+# gpt-5.5 defaults to xhigh reasoning, which blows the judge timeout on large
+# traces. Pin a low effort for scoring — at "low"/"none" gpt-5.5 grades a 1.5M-
+# token trace in well under the 120s budget; at xhigh it times out.
+DEFAULT_CODEX_REASONING_EFFORT = "low"
 DEFAULT_BACKEND_MODELS: dict[str, str] = {
     "claude": DEFAULT_CLAUDE_MODEL,
     "codex": DEFAULT_CODEX_MODEL,
@@ -48,6 +56,35 @@ BACKEND_COMMANDS: dict[str, str] = {
     "hermes": "hermes",
     "openclaw": "openclaw",
 }
+
+# Errors that mean the backend itself is unusable (no credits, auth failure,
+# rate limit, or CLI missing), so callers can try another installed backend.
+_BACKEND_UNAVAILABLE_RE = re.compile(
+    r"out of credits|not logged in|please run|log\s?in|unauthoriz|forbidden|"
+    r"\b40[13]\b|\b429\b|quota|insufficient|usage limit|rate.?limit|limit reached|"
+    r"limit (?:will )?reset|resets? at|too many requests|"
+    r"cli not found|command not found|not installed|no such file",
+    re.IGNORECASE,
+)
+
+
+def is_backend_unavailable_error(message: str) -> bool:
+    """True if a scoring error means the backend is unusable for this run."""
+    return bool(_BACKEND_UNAVAILABLE_RE.search(message or ""))
+
+
+def installed_fallback_chain(primary: str) -> list[str]:
+    """Return primary first, then other installed backends in fallback order."""
+    chain = [primary]
+    for backend in AUTO_BACKEND_FALLBACK_ORDER:
+        if (
+            backend != primary
+            and backend not in chain
+            and shutil.which(BACKEND_COMMANDS[backend])
+        ):
+            chain.append(backend)
+    return chain
+
 BACKEND_ENV_MARKERS: dict[str, tuple[str, ...]] = {
     "claude": ("CLAUDECODE", "CLAUDE_CODE", "CLAUDECODE_SESSION_ID", "CLAUDE_PROJECT_DIR"),
     "codex": ("CODEX_THREAD_ID", "CODEX_SANDBOX", "CODEX_CI"),
@@ -325,6 +362,9 @@ def _build_codex_cmd(
     cmd = [
         command, "exec",
         "-c", "analytics.enabled=false",
+        # Keep reasoning low: gpt-5.5 defaults to xhigh, which times out the
+        # judge on large traces (see DEFAULT_CODEX_REASONING_EFFORT).
+        "-c", f'model_reasoning_effort="{DEFAULT_CODEX_REASONING_EFFORT}"',
         "--skip-git-repo-check",
         "--ephemeral",
         "--color", "never",
@@ -511,6 +551,11 @@ def run_default_agent_task(
                 text=True,
                 env=agent_env,
                 timeout=timeout_seconds,
+                # codex exec reads stdin in addition to the prompt arg; without an
+                # explicit EOF it blocks ("Reading additional input from stdin…")
+                # whenever stdin isn't a closed/empty stream (daemon, pipelines,
+                # background jobs), hanging until the timeout. DEVNULL gives EOF.
+                stdin=subprocess.DEVNULL,
             )
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"Timed out waiting for codex ({timeout_seconds}s)")
@@ -550,6 +595,7 @@ def run_default_agent_task(
                 text=True,
                 env=agent_env,
                 timeout=timeout_seconds + 10,
+                stdin=subprocess.DEVNULL,  # avoid blocking on inherited stdin (see codex note)
             )
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"Timed out waiting for openclaw ({timeout_seconds}s)")
@@ -575,6 +621,7 @@ def run_default_agent_task(
                 text=True,
                 env=agent_env,
                 timeout=timeout_seconds + 10,
+                stdin=subprocess.DEVNULL,  # avoid blocking on inherited stdin (see codex note)
             )
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"Timed out waiting for hermes ({timeout_seconds}s)")

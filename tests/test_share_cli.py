@@ -556,6 +556,77 @@ def test_score_traces_keyboard_interrupt_does_not_submit_beyond_workers(monkeypa
     assert set(started) == {"u1", "u2"}
 
 
+def test_score_traces_rescores_stale_via_force_ids(monkeypatch):
+    """Already-scored rows in force_ids are re-scored (the web's stale-grade
+    refresh); other already-scored rows are left untouched."""
+    scored = []
+    monkeypatch.setattr(share_cli.share_flow, "score_compute",
+                        lambda sid, **k: scored.append(sid) or
+                        {"ok": True, "fields": {}, "failure_value": 5, "display_title": None})
+    monkeypatch.setattr(share_cli.share_flow, "persist_score", lambda conn, sid, fields: None)
+    rows = [
+        _row(fv=None, session_id="never"),   # never scored -> always scored
+        _row(fv=2, session_id="stale"),      # scored but grew -> in force_ids -> re-scored
+        _row(fv=3, session_id="fresh"),      # scored, not stale -> skipped
+    ]
+    done = share_cli.score_traces(None, rows, force_ids={"stale"})
+    assert done == 2
+    assert set(scored) == {"never", "stale"}
+    assert next(r for r in rows if r["session_id"] == "stale")["ai_failure_value_score"] == 5
+    assert next(r for r in rows if r["session_id"] == "fresh")["ai_failure_value_score"] == 3
+
+
+def test_backend_unavailable_matcher():
+    assert share_cli._backend_unavailable("codex exited 1: ERROR: Your workspace is out of credits.")
+    assert share_cli._backend_unavailable("ERROR: not logged in. Run codex login")
+    assert share_cli._backend_unavailable("HTTP 401 Unauthorized")
+    assert share_cli._backend_unavailable("codex CLI not found. Install it.")
+    # usage/session limits count as "switch backend" (Kai's case)
+    assert share_cli._backend_unavailable("You've hit your usage limit; resets at 5pm")
+    assert share_cli._backend_unavailable("rate limited (HTTP 429)")
+    assert share_cli._backend_unavailable("limit reached, will reset tomorrow")
+    # per-trace failures must NOT be treated as a dead backend
+    assert not share_cli._backend_unavailable("judge timed out after 120s")
+    assert not share_cli._backend_unavailable("could not parse scoring JSON")
+
+
+def test_score_traces_falls_back_on_missing_backend_cli(monkeypatch):
+    """A missing primary CLI is a backend failure, not a per-trace failure."""
+    monkeypatch.setattr(share_cli, "_backend_chain", lambda backend: ["codex", "claude"])
+    used = []
+
+    def fake_compute(sid, *, backend="auto", model=None):
+        used.append(backend)
+        if backend == "codex":
+            return {"ok": False, "error": "codex CLI not found. Install it."}
+        return {"ok": True, "fields": {}, "failure_value": 4, "display_title": None}
+
+    monkeypatch.setattr(share_cli.share_flow, "score_compute", fake_compute)
+    monkeypatch.setattr(share_cli.share_flow, "persist_score", lambda conn, sid, fields: None)
+    rows = [_row(fv=None, session_id=f"s{i}") for i in range(3)]
+    done = share_cli.score_traces(None, rows, workers=2)
+    assert done == 3
+    assert all(r["ai_failure_value_score"] == 4 for r in rows)
+    assert "codex" in used and "claude" in used  # tried codex, fell back to claude
+
+
+def test_score_traces_no_fallback_on_per_trace_error(monkeypatch):
+    """A judge timeout is not a dead backend — don't waste a fallback attempt."""
+    monkeypatch.setattr(share_cli, "_backend_chain", lambda backend: ["codex", "claude"])
+    used = []
+
+    def fake_compute(sid, *, backend="auto", model=None):
+        used.append(backend)
+        return {"ok": False, "error": "judge timed out after 120s"}
+
+    monkeypatch.setattr(share_cli.share_flow, "score_compute", fake_compute)
+    monkeypatch.setattr(share_cli.share_flow, "persist_score", lambda conn, sid, fields: None)
+    rows = [_row(fv=None, session_id="s0")]
+    done = share_cli.score_traces(None, rows, workers=1)
+    assert done == 0
+    assert used == ["codex"]  # no fallback for a per-trace failure
+
+
 def test_score_traces_respects_cap(monkeypatch):
     monkeypatch.setattr(share_cli.share_flow, "score_compute",
                         lambda sid, **k: {"ok": True, "fields": {}, "failure_value": 4,

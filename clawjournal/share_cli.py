@@ -32,7 +32,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .config import load_config
-from .scoring.backends import default_model_for_backend, resolve_backend
+from .scoring.backends import (
+    default_model_for_backend,
+    installed_fallback_chain,
+    is_backend_unavailable_error,
+    resolve_backend,
+)
 from .workbench.index import (
     SHAREABLE_HOLD_STATES,
     effective_hold_state,
@@ -320,9 +325,33 @@ def _rank_key(r: dict):
     return (r.get("ai_failure_value_score") is None, -(r.get("ai_failure_value_score") or 0))
 
 
+def _backend_unavailable(err: str) -> bool:
+    return is_backend_unavailable_error(err)
+
+
+def _backend_chain(backend: str) -> list[str]:
+    """Resolved primary backend first, then other *installed* backends to fall
+    back to (in AUTO_BACKEND_FALLBACK_ORDER) when the primary turns out unusable.
+
+    If the backend can't be resolved up front (none detected/installed), return
+    the requested value as-is and let score_compute surface the error per trace —
+    the pre-fallback behavior."""
+    try:
+        primary = resolve_backend(backend)
+    except Exception:  # noqa: BLE001 — no backend resolvable; degrade gracefully
+        return [backend]
+    return installed_fallback_chain(primary)
+
+
 def score_traces(conn, rows: list[dict], *, backend: str = "auto",
-                 model: str | None = None, cap: int | None = None, workers: int = 6) -> int:
+                 model: str | None = None, cap: int | None = None, workers: int = 6,
+                 force_ids: set[str] | None = None) -> int:
     """Score unscored rows for failure value, IN PARALLEL.
+
+    Scores rows with no failure value, plus any row whose session_id is in
+    `force_ids` — used to re-score sessions that grew since they were last graded
+    (the web's `include_stale_scored` behavior), so a stale early grade is
+    overwritten with one that reflects the current content.
 
     The slow AI-judge step runs in worker threads (each with its own read
     connection via share_flow.score_compute), while DB writes happen serially on
@@ -331,31 +360,51 @@ def score_traces(conn, rows: list[dict], *, backend: str = "auto",
     Ctrl-C we stop queueing new calls, cancel any submitted calls that have not
     started, and return what's done (in-flight calls may still finish). Mutates
     rows in place and persists.
+
+    If the chosen backend turns out unusable (no credits / not logged in / CLI
+    missing), traces are automatically retried on the next installed backend
+    (model defaults follow the new backend) rather than all failing.
     """
     from concurrent.futures import FIRST_COMPLETED, wait
 
-    unscored = [r for r in rows if r.get("ai_failure_value_score") is None]
+    force_ids = force_ids or set()
+    unscored = [r for r in rows
+                if r.get("ai_failure_value_score") is None or r["session_id"] in force_ids]
     if cap is not None:
         unscored = unscored[:cap]
     if not unscored:
         return 0
     total = len(unscored)
+    restale = sum(1 for r in unscored if r.get("ai_failure_value_score") is not None)
+    suffix = f" ({restale} re-scored after new activity)" if restale else ""
     n_workers = max(1, min(workers, total))
-    print(f"  {DIM}Scoring {total} unscored trace(s) for failure value "
+    print(f"  {DIM}Scoring {total} trace(s) for failure value{suffix} "
           f"({n_workers} in parallel, AI judge — Ctrl-C to skip the rest)…{RST}")
     done = 0
     pool = ThreadPoolExecutor(max_workers=n_workers)
     rows_iter = iter(unscored)
-    futures = {}
+    futures = {}  # future -> (row, backend_used)
+
+    chain = _backend_chain(backend)
+    dead: set[str] = set()
+
+    def active_backend():
+        return next((b for b in chain if b not in dead), None)
+
+    def submit(r) -> bool:
+        be = active_backend()
+        if be is None:
+            return False
+        futures[pool.submit(share_flow.score_compute, r["session_id"],
+                            backend=be, model=model)] = (r, be)
+        return True
 
     def submit_next() -> bool:
         try:
             r = next(rows_iter)
         except StopIteration:
             return False
-        sid = r["session_id"]
-        futures[pool.submit(share_flow.score_compute, sid, backend=backend, model=model)] = r
-        return True
+        return submit(r)
 
     for _ in range(n_workers):
         submit_next()
@@ -366,19 +415,35 @@ def score_traces(conn, rows: list[dict], *, backend: str = "auto",
             if not completed:
                 continue
             for fut in completed:
-                r = futures.pop(fut)
+                r, used = futures.pop(fut)
                 sid = r["session_id"]
                 res = fut.result()
-                if not res.get("ok"):
+                if res.get("ok"):
+                    share_flow.persist_score(conn, sid, res["fields"])  # serial write on main conn
+                    r["ai_failure_value_score"] = res.get("failure_value")
+                    if res.get("display_title"):
+                        r["ai_display_title"] = res["display_title"]
+                    done += 1
                     print(f"\r  {DIM}scored {done}/{total}…{RST}", end="", flush=True)
                     submit_next()
                     continue
-                share_flow.persist_score(conn, sid, res["fields"])  # serial write on main conn
-                r["ai_failure_value_score"] = res.get("failure_value")
-                if res.get("display_title"):
-                    r["ai_display_title"] = res["display_title"]
-                done += 1
-                print(f"\r  {DIM}scored {done}/{total}…{RST}", end="", flush=True)
+                err = str(res.get("error") or "unknown error")
+                if _backend_unavailable(err):
+                    newly = used not in dead
+                    dead.add(used)
+                    nxt = active_backend()
+                    if nxt is not None:
+                        if newly:
+                            print(f"\r  {YEL}⚠ backend '{used}' unavailable "
+                                  f"({err[:80]}); switching to '{nxt}'…{RST}")
+                        submit(r)  # retry this trace on the next backend
+                        continue
+                    if newly:
+                        print(f"\r  {RED}✗ no usable scoring backend left "
+                              f"('{used}': {err[:80]}).{RST}")
+                else:
+                    print(f"\r  {YEL}✗ {sid[:8]} scoring failed: {err[:160]}{RST}")
+                print(f"  {DIM}scored {done}/{total}…{RST}", end="", flush=True)
                 submit_next()
         print()
     except KeyboardInterrupt:
@@ -434,22 +499,26 @@ def step_queue(conn, settings, args) -> list[dict]:
         except Exception:  # noqa: BLE001
             backend_ok = False
         if backend_ok:
-            # Scoring uses the backend's fast default model (Claude → haiku,
-            # Codex → gpt-5.4-mini) via score_session; --score-model overrides.
+            # Scoring uses the backend's fast default model via score_session;
+            # --score-model overrides.
             score_model = getattr(args, "score_model", None)
             from types import SimpleNamespace
             pool_args = SimpleNamespace(**{**vars(args), "min_failure_value": None})
             pool = select_queue_rows(candidates, settings, pool_args, limit=False)
+            # include_stale_scored re-selects sessions that were graded earlier
+            # and then grew (end_time advanced past ai_scored_at) — matches the
+            # web's background scorer so a stale early grade gets refreshed.
             ready_ids = {
                 r["session_id"] for r in query_unscored_sessions(
                     conn,
                     limit=5000,
                     source=args.source,
                     settle_seconds=SCORE_SETTLE_SECONDS,
+                    include_stale_scored=True,
                 )
             }
             pool = [r for r in pool if r["session_id"] in ready_ids]
-            score_traces(conn, pool, model=score_model, cap=args.limit)
+            score_traces(conn, pool, model=score_model, cap=args.limit, force_ids=ready_ids)
 
     rows = select_queue_rows(candidates, settings, args)
     if not rows:

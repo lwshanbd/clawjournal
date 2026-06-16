@@ -26,6 +26,8 @@ from clawjournal.scoring.backends import (
     default_model_for_backend,
     detect_available_backend,
     format_codex_runtime_error,
+    installed_fallback_chain,
+    is_backend_unavailable_error,
     require_backend_command,
     resolve_backend,
     resolve_model_for_backend,
@@ -43,7 +45,7 @@ class TestConstants:
 
     def test_default_backend_models(self):
         assert DEFAULT_CLAUDE_MODEL == "claude-haiku-4-5"
-        assert DEFAULT_CODEX_MODEL == "gpt-5.4-mini"
+        assert DEFAULT_CODEX_MODEL == "gpt-5.5"
         assert default_model_for_backend("claude") == DEFAULT_CLAUDE_MODEL
         assert default_model_for_backend("codex") == DEFAULT_CODEX_MODEL
         assert default_model_for_backend("hermes") is None
@@ -51,6 +53,29 @@ class TestConstants:
         assert resolve_model_for_backend("claude", None) == DEFAULT_CLAUDE_MODEL
         assert resolve_model_for_backend("codex", None) == DEFAULT_CODEX_MODEL
         assert resolve_model_for_backend("claude", "opus") == "opus"
+
+
+class TestBackendFallbackHelpers:
+    def test_is_backend_unavailable_error(self):
+        assert is_backend_unavailable_error(
+            "codex exited 1: ERROR: Your workspace is out of credits."
+        )
+        assert is_backend_unavailable_error("not logged in; run codex login")
+        assert is_backend_unavailable_error("HTTP 401 Unauthorized")
+        assert is_backend_unavailable_error("codex CLI not found. Install it.")
+        assert is_backend_unavailable_error("You've hit your usage limit; resets at 5pm")
+        assert is_backend_unavailable_error("rate limited (HTTP 429)")
+        assert is_backend_unavailable_error("limit reached, will reset tomorrow")
+        assert not is_backend_unavailable_error("judge timed out after 120s")
+        assert not is_backend_unavailable_error("could not parse scoring JSON")
+
+    def test_installed_fallback_chain_orders_and_filters(self, monkeypatch):
+        monkeypatch.setattr(
+            "clawjournal.scoring.backends.shutil.which",
+            lambda cmd: cmd in {"codex", "claude"},
+        )
+        assert installed_fallback_chain("codex") == ["codex", "claude"]
+        assert installed_fallback_chain("claude") == ["claude", "codex"]
 
 
 class TestDetection:
@@ -474,6 +499,34 @@ class TestRunDefaultAgentTaskCodex:
             backend="codex", cwd=tmp_path, task_prompt="review",
         )
         assert captured_cmd[captured_cmd.index("--model") + 1] == DEFAULT_CODEX_MODEL
+
+    def test_low_reasoning_effort_forwarded(self, monkeypatch, tmp_path):
+        """gpt-5.5 defaults to xhigh (times out on big traces); we pin low effort."""
+        _stub_which(monkeypatch)
+        captured_cmd = []
+
+        def spy_run(cmd, **kw):
+            captured_cmd.extend(cmd)
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr("clawjournal.scoring.backends.subprocess.run", spy_run)
+        run_default_agent_task(backend="codex", cwd=tmp_path, task_prompt="review")
+        assert 'model_reasoning_effort="low"' in captured_cmd
+
+    def test_stdin_closed_to_avoid_hang(self, monkeypatch, tmp_path):
+        """codex exec reads stdin in addition to the prompt arg; we must give it
+        EOF (stdin=DEVNULL) or it blocks until timeout in non-interactive contexts."""
+        _stub_which(monkeypatch)
+        captured = {}
+
+        def spy_run(cmd, **kw):
+            captured.update(kw)
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr("clawjournal.scoring.backends.subprocess.run", spy_run)
+        run_default_agent_task(backend="codex", cwd=tmp_path, task_prompt="review")
+        assert captured.get("stdin") is subprocess.DEVNULL
+        assert "input" not in captured  # cannot pass both
 
     def test_nonzero_exit_raises(self, monkeypatch, tmp_path):
         _stub_which(monkeypatch)
